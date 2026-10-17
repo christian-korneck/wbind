@@ -22,32 +22,25 @@ func listAction(_ context.Context, cmd *cli.Command) error {
 	if cmd.NArg() > 1 {
 		return errors.New("list: expected at most one TARGET (see 'wbind list --help')")
 	}
-	if err := requireElevated(); err != nil {
+	var target string
+	if cmd.NArg() == 1 {
+		var err error
+		if target, err = resolvePath(cmd.Args().Get(0)); err != nil {
+			return fmt.Errorf("list: %w", err)
+		}
+	}
+	b, err := newBinder(cmd)
+	if err != nil {
 		return fmt.Errorf("list: %w", err)
 	}
-	w := cmd.Root().Writer
-	headings := !cmd.Bool("noheadings")
 
-	if cmd.NArg() == 1 {
-		target, err := resolvePath(cmd.Args().Get(0))
-		if err != nil {
-			return fmt.Errorf("list: %w", err)
+	// A full listing prints whatever was found even if some volumes failed;
+	// the error still makes the exit status non-zero.
+	mounts, err := b.list(target)
+	if err == nil || len(mounts) > 0 {
+		if perr := printMounts(cmd.Root().Writer, mounts, !cmd.Bool("noheadings")); perr != nil {
+			return fmt.Errorf("list: %w", perr)
 		}
-		m, mounted, err := findMount(target)
-		if err != nil {
-			return fmt.Errorf("list: %w", err)
-		}
-		if !mounted {
-			return fmt.Errorf("list: %s: not mounted", target)
-		}
-		return printMounts(w, []bindfilter.BindMapping{m}, headings)
-	}
-
-	// Print whatever was found even if some volumes failed; the error still
-	// makes the exit status non-zero.
-	mounts, err := allMounts()
-	if perr := printMounts(w, mounts, headings); perr != nil {
-		return fmt.Errorf("list: %w", perr)
 	}
 	if err != nil {
 		return fmt.Errorf("list: %w", err)

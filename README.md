@@ -36,6 +36,41 @@ You can also "overmount", mount a file into an already mounted dir and mount fro
 
 For the full usage see the auto-generated [CLI reference docs](cli-reference.md).
 
+### Use without elevation (via an optional helper service)
+
+To optionally allow unprivileged users to mount/unmount/list bind mounts, `wbind` offters an optional helper service.
+
+You install it once with admin privileges with:
+
+```
+wbind helperservice install
+```
+
+The helper service runs as a privileged windows service (`wbindd`) in the background and and from then on unprivileged users can run any wbind command against it with the `-u` / `--unprivileged` flag.
+ 
+Example:
+
+```
+wbind -u ls
+wbind -u mount c:\source c:\dest
+wbind -u unmount c:\dest
+```
+
+(After installation users might need to re-login to Windows once).
+
+The connection between client and server happens over a named pipe (`\\.\pipe\wbindd`). Access to the pipe is restricted to a specific group. By default the service installation creates a local group `wbind-users` and adds the `Authenticated Users` group as its member, so all users can access it.
+
+You can alternatively define your own group. It will be created if it doesn't exist yet (and no members will be added - this is up to you):
+
+```
+wbind helperservice install [--group <name>]
+```
+
+To remove the service, run `wbind helperservice uninstall` from an elevated shell. The group is kept.
+
+Notes:
+- Using the helperservice has security implications and comes with risks
+- expect problems with the helper service and UNC paths (smb shares): With the helperservice you can only uses a SOURCE path that the user that runs the service (by default: the local `SYSTEM` user) has access to. So you can't use a UNC path (smb share) as source to which only the user that runs `wbind -u mount` has access to, but not the user that runs the service. To work around this you can give the user that runs the service access to the respective UNC path / smb share.
 
 ## Demo
 

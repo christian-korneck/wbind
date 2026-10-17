@@ -32,6 +32,10 @@ func newApp() *cli.Command {
 		Usage:           "bind mounts on MS Windows",
 		Version:         buildVersion(),
 		HideHelpCommand: true,
+		// Root flags apply to all subcommands; those without use for it ignore it.
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "unprivileged", Aliases: []string{"u"}, Usage: "use the " + serviceName + " helper service, so that mount, unmount and list need no elevation"},
+		},
 		Commands: []*cli.Command{
 			{
 				Name:      "mount",
@@ -57,6 +61,35 @@ func newApp() *cli.Command {
 					&cli.BoolFlag{Name: "noheadings", Aliases: []string{"n"}, Usage: "do not print a header line"},
 				},
 				Action: listAction,
+			},
+			{
+				Name:            "helperservice",
+				Usage:           "manage the " + serviceName + " helper service, which serves --unprivileged requests",
+				HideHelpCommand: true,
+				Commands: []*cli.Command{
+					{
+						Name:  "install",
+						Usage: "copy wbind.exe to the system directory, then install and start the helper service from there",
+						Flags: []cli.Flag{
+							&cli.StringFlag{Name: "group", Usage: "let members of `GROUP` use the service; it is created if missing (default: " + defaultGroup + ", created with Authenticated Users as member)"},
+						},
+						Action: installAction,
+					},
+					{
+						Name:   "uninstall",
+						Usage:  "stop and remove the helper service",
+						Action: uninstallAction,
+					},
+				},
+			},
+			{
+				Name:   "daemon",
+				Usage:  "run the helper service",
+				Hidden: true,
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "group", Usage: "let members of `GROUP` connect"},
+				},
+				Action: daemonAction,
 			},
 			{
 				Name:  "docs",

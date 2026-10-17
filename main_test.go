@@ -5,14 +5,28 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/Microsoft/go-winio"
 	"github.com/Microsoft/go-winio/pkg/bindfilter"
 	"golang.org/x/sys/windows"
 )
+
+// TestMain runs the CLI instead of the tests when the SCM starts this test
+// binary as the helper service (see TestHelperService).
+func TestMain(m *testing.M) {
+	if len(os.Args) > 1 && os.Args[1] == "daemon" {
+		main()
+		return
+	}
+	m.Run()
+}
 
 // run executes the CLI in-process and returns what it wrote to stdout.
 func run(t *testing.T, args ...string) (string, error) {
@@ -29,17 +43,39 @@ func elevated() bool {
 	return windows.GetCurrentProcessToken().IsElevated()
 }
 
+// usePipe points the helper service client and listen at p for the rest of
+// the test.
+func usePipe(t *testing.T, p string) {
+	old := pipeName
+	pipeName = p
+	t.Cleanup(func() { pipeName = old })
+}
+
+// startHelper serves h in-process on a test pipe and points the client at
+// it. The pipe has the default security, which admits the test process.
+func startHelper(t *testing.T, h http.Handler) {
+	t.Helper()
+	usePipe(t, `\\.\pipe\wbind-test-`+t.Name())
+	l, err := winio.ListenPipe(pipeName, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: h}
+	go srv.Serve(l)
+	t.Cleanup(func() { srv.Close() })
+}
+
 func TestHelp(t *testing.T) {
 	out, err := run(t, "--help")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"bind SOURCE (directory or file) at TARGET", "unmount", "list, ls", "docs"} {
+	for _, want := range []string{"bind SOURCE (directory or file) at TARGET", "unmount", "list, ls", "helperservice", "docs"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("help lacks %q:\n%s", want, out)
 		}
 	}
-	for _, gone := range []string{"create", "unmount, umount", ", rm"} {
+	for _, gone := range []string{"create", "unmount, umount", ", rm", "daemon"} {
 		if strings.Contains(out, gone) {
 			t.Errorf("help still mentions %q:\n%s", gone, out)
 		}
@@ -49,7 +85,7 @@ func TestHelp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"SOURCE TARGET", "--ro"} {
+	for _, want := range []string{"SOURCE TARGET", "--ro", "--unprivileged"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("mount help lacks %q:\n%s", want, out)
 		}
@@ -97,10 +133,73 @@ func TestRequiresElevation(t *testing.T) {
 		t.Skip("running elevated")
 	}
 	src, dst := t.TempDir(), t.TempDir()
-	for _, args := range [][]string{{"mount", src, dst}, {"unmount", dst}, {"list"}, {"list", dst}} {
+	for _, args := range [][]string{{"mount", src, dst}, {"unmount", dst}, {"list"}, {"list", dst}, {"helperservice", "install"}, {"helperservice", "uninstall"}, {"-u", "helperservice", "install"}} {
 		_, err := run(t, args...)
 		if err == nil || !strings.Contains(err.Error(), "administrator") {
 			t.Errorf("%v: want elevation error, got %v", args, err)
+		}
+	}
+}
+
+func TestUnprivilegedWithoutHelper(t *testing.T) {
+	usePipe(t, `\\.\pipe\wbind-test-missing`)
+	dir := t.TempDir()
+	// -u is global: it works before and after the subcommand.
+	for _, args := range [][]string{{"-u", "mount", dir, filepath.Join(dir, "mnt")}, {"unmount", "-u", dir}, {"-u", "ls"}, {"list", "-u"}} {
+		_, err := run(t, args...)
+		if err == nil || !strings.Contains(err.Error(), "cannot connect to the helper service") {
+			t.Errorf("%v: want connection error, got %v", args, err)
+		}
+	}
+}
+
+// TestUnprivilegedListWarnings checks that a partial listing from the helper
+// service prints like a local one: the mounts found, then the errors.
+func TestUnprivilegedListWarnings(t *testing.T) {
+	warnings := []string{`\\?\Volume{a}\: Access is denied.`, `\\?\Volume{b}\: Access is denied.`}
+	startHelper(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, listResponse{
+			Mounts:   []bindfilter.BindMapping{{MountPoint: `C:\mnt`, Targets: []string{`D:\data`}}},
+			Warnings: warnings,
+		})
+	}))
+
+	out, err := run(t, "list", "-u", "-n")
+	if want := `C:\mnt  D:\data  rw` + "\n"; out != want {
+		t.Errorf("list -u -n: got %q, want %q", out, want)
+	}
+	if want := "list: " + strings.Join(warnings, "\n"); err == nil || err.Error() != want {
+		t.Errorf("list -u -n: got error %v, want %q", err, want)
+	}
+}
+
+func TestHandlerRejectsBadRequests(t *testing.T) {
+	dir := t.TempDir()
+	body := func(source, target string) string {
+		b, err := json.Marshal(mountRequest{Source: source, Target: target})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+
+	for _, tc := range []struct{ method, url, body string }{
+		{"POST", "/v1/mounts", "{"},
+		{"POST", "/v1/mounts", body("rel", dir)},
+		{"POST", "/v1/mounts", body(dir, "rel")},
+		{"POST", "/v1/mounts", body(filepath.Join(dir, "missing"), filepath.Join(dir, "mnt"))},
+		{"POST", "/v1/mounts", body(dir, dir)},
+		{"DELETE", "/v1/mounts", ""},
+		{"DELETE", "/v1/mounts?target=rel", ""},
+		{"GET", "/v1/mounts?target=rel", ""},
+	} {
+		rec := httptest.NewRecorder()
+		newHandler().ServeHTTP(rec, httptest.NewRequest(tc.method, tc.url, strings.NewReader(tc.body)))
+		var e struct {
+			Message string `json:"message"`
+		}
+		if rec.Code != http.StatusBadRequest || json.Unmarshal(rec.Body.Bytes(), &e) != nil || e.Message == "" {
+			t.Errorf("%s %s %s: got %d %q, want 400 with a message", tc.method, tc.url, tc.body, rec.Code, rec.Body)
 		}
 	}
 }
