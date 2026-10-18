@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -31,8 +32,15 @@ func TestMain(m *testing.M) {
 // run executes the CLI in-process and returns what it wrote to stdout.
 func run(t *testing.T, args ...string) (string, error) {
 	t.Helper()
+	return runStdin(t, "", args...)
+}
+
+// runStdin is run with stdin as the CLI's standard input.
+func runStdin(t *testing.T, stdin string, args ...string) (string, error) {
+	t.Helper()
 	app := newApp()
 	var out bytes.Buffer
+	app.Reader = strings.NewReader(stdin)
 	app.Writer = &out
 	app.ErrWriter = &out
 	err := app.Run(context.Background(), append([]string{"wbind"}, args...))
@@ -60,7 +68,7 @@ func startHelper(t *testing.T, h http.Handler) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &http.Server{Handler: h}
+	srv := newServer(h)
 	go srv.Serve(l)
 	t.Cleanup(func() { srv.Close() })
 }
@@ -70,7 +78,7 @@ func TestHelp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"bind SOURCE (directory or file) at TARGET", "unmount", "list, ls", "helperservice", "docs"} {
+	for _, want := range []string{"bind SOURCE (directory or file) at TARGET", "unmount", "list, ls", "helperservice", "sig", "docs", "--whitelist"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("help lacks %q:\n%s", want, out)
 		}
@@ -85,7 +93,7 @@ func TestHelp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"SOURCE TARGET", "--ro", "--unprivileged"} {
+	for _, want := range []string{"SOURCE TARGET", "--ro", "--unprivileged", "--whitelist-file", "--sig-file"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("mount help lacks %q:\n%s", want, out)
 		}
@@ -101,6 +109,12 @@ func TestUsageErrors(t *testing.T) {
 		{"unmount", "a", "b"},
 		{"list", "a", "b"},
 		{"ls", "a", "b"},
+		{"sig", "keygen", "a"},
+		{"sig", "example", "a"},
+		{"sig", "sign", "a"},
+		{"sig", "test"},
+		{"sig", "test", "a"},
+		{"sig", "test", "a", "b", "c"},
 	} {
 		_, err := run(t, args...)
 		if err == nil || !strings.Contains(err.Error(), "--help") {
@@ -112,14 +126,23 @@ func TestUsageErrors(t *testing.T) {
 func TestMountValidatesPaths(t *testing.T) {
 	dir := t.TempDir()
 	missing := filepath.Join(dir, "missing")
+	// Messages show paths as typed, even with 8.3 names in them (if the
+	// volume has none, this is the same path again).
+	shortMissing := filepath.Join(shortPath(t, dir), "missing")
 
 	for _, tc := range []struct {
 		args []string
 		want string
 	}{
 		{[]string{"mount", missing, dir}, missing},
+		{[]string{"mount", shortMissing, dir}, shortMissing},
 		{[]string{"mount", dir, dir}, "same path"},
 		{[]string{"mount", dir, filepath.Join(missing, "x")}, "parent directory"},
+		{[]string{"mount", "--sig-file", "x", dir, filepath.Join(dir, "mnt")}, "--sig-file needs --whitelist"},
+		{[]string{"unmount", "--whitelist-file", "x", dir}, "--whitelist-file needs --whitelist"},
+		{[]string{"-w", "mount", "--whitelist-file", missing, dir, filepath.Join(dir, "mnt")}, missing},
+		{[]string{"-w", "mount", "--whitelist-file", "-", "--sig-file", "-", dir, filepath.Join(dir, "mnt")}, "only one"},
+		{[]string{"helperservice", "install", "--unmount-requires-whitelist"}, "needs --pubkey"},
 	} {
 		_, err := run(t, tc.args...)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
@@ -194,7 +217,7 @@ func TestHandlerRejectsBadRequests(t *testing.T) {
 		{"GET", "/v1/mounts?target=rel", ""},
 	} {
 		rec := httptest.NewRecorder()
-		newHandler().ServeHTTP(rec, httptest.NewRequest(tc.method, tc.url, strings.NewReader(tc.body)))
+		newHandler(nil, false).ServeHTTP(rec, httptest.NewRequest(tc.method, tc.url, strings.NewReader(tc.body)))
 		var e struct {
 			Message string `json:"message"`
 		}
@@ -204,12 +227,59 @@ func TestHandlerRejectsBadRequests(t *testing.T) {
 	}
 }
 
+// TestWhitelistDenied checks that a helper service with a public key
+// rejects requests without a valid whitelist that allows them. The
+// requests fail before any bind filter call, so no elevation is needed.
+func TestWhitelistDenied(t *testing.T) {
+	src := canonical(t, t.TempDir())
+	dst := filepath.Join(canonical(t, t.TempDir()), "mnt")
+	pub, wl, sig := signWhitelist(t, escapeMeta(src)+" | C:/elsewhere/*\n")
+	_, _, otherSig := signWhitelist(t, escapeMeta(src)+" | C:/elsewhere/*\n")
+	startHelper(t, newHandler(pub, true))
+
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"-u", "mount", src, dst}, "signed whitelist"},
+		{[]string{"-u", "unmount", dst}, "signed whitelist"},
+		{[]string{"-w", "mount", "--whitelist-file", wl, "--sig-file", otherSig, src, dst}, "signature does not match"},
+		{[]string{"-w", "unmount", "--whitelist-file", wl, "--sig-file", otherSig, dst}, "signature does not match"},
+		{[]string{"-w", "mount", "--whitelist-file", wl, "--sig-file", sig, src, dst}, "not allowed by the whitelist"},
+	} {
+		if _, err := run(t, tc.args...); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%v: got %v, want an error containing %q", tc.args, err, tc.want)
+		}
+	}
+
+	// A valid whitelist over an anonymous connection: the caller is unknown.
+	body, err := json.Marshal(mountRequest{Source: src, Target: dst})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "http://"+serviceName+"/v1/mounts", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(whitelistHeader, base64.StdEncoding.EncodeToString(readFile(t, wl)))
+	req.Header.Set(signatureHeader, base64.StdEncoding.EncodeToString(readFile(t, sig)))
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var e struct{ Message string }
+	if json.NewDecoder(resp.Body).Decode(&e); resp.StatusCode != http.StatusForbidden || !strings.Contains(e.Message, "cannot identify the caller") {
+		t.Errorf("anonymous: got %d %q, want 403 and an identification error", resp.StatusCode, e.Message)
+	}
+}
+
 func TestDocs(t *testing.T) {
 	md, err := run(t, "docs")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"# NAME", "## mount", "## unmount", "## list, ls", "## docs", "--ro"} {
+	for _, want := range []string{"# NAME", "## mount", "## unmount", "## list, ls", "## sig", "## docs", "--ro"} {
 		if !strings.Contains(md, want) {
 			t.Errorf("markdown lacks %q:\n%s", want, md)
 		}
@@ -269,6 +339,7 @@ func TestResolvePath(t *testing.T) {
 
 	for _, tc := range []struct{ in, want string }{
 		{"missing", filepath.Join(cwd, "missing")},
+		{filepath.Join(shortPath(t, dir), "missing"), filepath.Join(shortPath(t, dir), "missing")},
 		{dir + `\`, canon},
 		{strings.ReplaceAll(dir, `\`, "/"), canon},
 		{strings.ToLower(dir), canon},
@@ -281,6 +352,24 @@ func TestResolvePath(t *testing.T) {
 		}
 		if got != tc.want {
 			t.Errorf("%q: got %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestCanonicalPath(t *testing.T) {
+	dir := t.TempDir()
+	canon, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ in, want string }{
+		{shortPath(t, dir), canon},
+		{filepath.Join(strings.ToLower(dir), "missing"), filepath.Join(canon, "missing")},
+		{filepath.Join(shortPath(t, dir), "missing"), filepath.Join(canon, "missing")},
+	} {
+		got, err := canonicalPath(tc.in)
+		if err != nil || got != tc.want {
+			t.Errorf("canonicalPath(%q) = %q, %v; want %q", tc.in, got, err, tc.want)
 		}
 	}
 }

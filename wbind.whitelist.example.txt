@@ -1,0 +1,136 @@
+# wbind whitelist
+#
+# A helper service installed with 'wbind helperservice install --pubkey FILE'
+# accepts a mount only if a rule in a whitelist signed for that key allows
+# its SOURCE and TARGET. Anyone may unmount anything, unless the service was
+# also installed with --unmount-requires-whitelist.
+#
+# Workflow:
+#   wbind sig keygen                  create wbind.privkey.txt and wbind.pubkey.txt (once)
+#   (edit this file)
+#   wbind sig test SOURCE TARGET      show which rule allows a pair for the current user
+#   wbind sig sign                    sign this file into wbind.sig.txt
+#   wbind helperservice install --pubkey wbind.pubkey.txt
+#   wbind -w mount SOURCE TARGET      users send this file and wbind.sig.txt along
+#
+# All example rules below are commented out: remove the # in front of the
+# ones you want. Lines starting with # are comments and blank lines are
+# ignored. The signature covers the rules only, so comments, blank lines,
+# spaces around | and line endings can change without signing again.
+#
+# Format: one rule per line, SOURCE | TARGET, optionally followed by | ro or
+# | rw. ro allows only read-only mounts (wbind mount --ro), rw allows both
+# read-write and read-only mounts. Without it, a rule is rw. Windows paths
+# cannot contain |.
+#
+# SOURCE and TARGET are doublestar patterns (github.com/bmatcuk/doublestar):
+#   /             path separator: write C:/dir, not C:\dir
+#   \             escapes the next character: \* \? \[ \] \{ \} \, \% match themselves
+#   *             any characters within one path element
+#   **            any number of path elements, as in a/**/b or a trailing /**
+#   ?             one character
+#   [abc] [a-z]   one character of a set or range
+#   [!abc]        one character not in a set
+#   {a,b}         one of the alternatives
+#
+# Matching ignores case. Paths are matched as the service sees them:
+# absolute, with . and .. removed, and symlinks, junctions and 8.3 short names
+# resolved. Rules are not normalized: write plain paths; . and .. are
+# rejected. UNC paths look like //server/share/dir.
+#
+# Variables (not environment variables; names ignore case):
+#   %SYSTEMDRIVE%  %SYSTEMROOT%  %WINDIR%
+#   %PROGRAMFILES%  %PROGRAMFILES(X86)%  %COMMONPROGRAMFILES%  %COMMONPROGRAMFILES(X86)%
+#   %PROGRAMDATA%  %ALLUSERSPROFILE%  %PUBLIC%
+# and of the user who calls the service:
+#   %USERPROFILE%  %APPDATA%  %LOCALAPPDATA%  %USERNAME%  %USERDOMAIN%
+# %APPDATA% and %LOCALAPPDATA% are always <profile>/AppData/Roaming and
+# <profile>/AppData/Local: folder redirection is ignored, because users can
+# change it themselves.
+#
+# Follow a path variable with /: %USERPROFILE%* would also match
+# C:/Users/bobby when bob calls.
+#
+# With --unmount-requires-whitelist, unmount checks the rules against the
+# source and mode (ro or rw) the mount really has.
+
+
+# --- Fixed paths -------------------------------------------------------------
+
+# A directory at one place.
+#D:/tools/editor | C:/tools/editor
+
+# A single file.
+#D:/configs/app.ini | C:/app/app.ini
+
+
+# --- Read-only and read-write ------------------------------------------------
+
+# Only read-only mounts (wbind mount --ro).
+#D:/media/** | %USERPROFILE%/media/* | ro
+
+# Read-write, and read-only too. The same as leaving out | rw.
+#D:/scratch/** | %USERPROFILE%/scratch/* | rw
+
+
+# --- Per user: each user only within their own profile ----------------------
+
+# Anything from the own profile at any directory directly in %USERPROFILE%/mnt.
+#%USERPROFILE%/** | %USERPROFILE%/mnt/*
+
+# Into roaming and local app data.
+#%USERPROFILE%/dotfiles/** | %APPDATA%/**
+#%USERPROFILE%/cache/*     | %LOCALAPPDATA%/Temp/*
+
+# A per-user directory on another drive. %USERDOMAIN% tells a local user
+# from a domain user of the same %USERNAME%.
+#E:/userdata/%USERDOMAIN%/%USERNAME%/** | %USERPROFILE%/data
+
+
+# --- System locations --------------------------------------------------------
+
+#D:/plugins/*      | %PROGRAMFILES%/App/plugins/*
+#D:/plugins32/*    | %PROGRAMFILES(X86)%/App/plugins/*
+#D:/vendor/*       | {%COMMONPROGRAMFILES%,%COMMONPROGRAMFILES(X86)%}/Vendor/*
+#D:/appdata/**     | %PROGRAMDATA%/App/**
+#D:/appdata2/**    | %ALLUSERSPROFILE%/App2/**
+#D:/handouts/*     | %PUBLIC%/Documents/*
+#%SYSTEMDRIVE%/staging/* | %SYSTEMDRIVE%/srv/*
+#D:/fonts/*.ttf    | %SYSTEMROOT%/Fonts/custom/*.ttf
+#D:/logs/app       | %WINDIR%/Logs/App
+
+
+# --- Wildcards ---------------------------------------------------------------
+
+# One character: D:/builds/v1 to D:/builds/v9, and D:/builds/vX.
+#D:/builds/v? | C:/app/current
+
+# A range: D:/releases/r0 to D:/releases/r9 only.
+#D:/releases/r[0-9] | C:/app/release
+
+# A set negated: any project whose name does not start with a dot.
+#D:/projects/[!.]* | C:/work/*
+
+# Alternatives.
+#D:/{src,docs}/** | C:/mnt/{src,docs}
+
+
+# --- Escaping ----------------------------------------------------------------
+
+# A literal % and literal brackets in a path.
+#D:/100\% done/** | C:/done/*
+#D:/archive \[2024\]/** | C:/archive/*
+
+
+# --- Network source ----------------------------------------------------------
+
+# The service reads the share with its own account (LocalSystem by default).
+#//fileserver/share/** | %USERPROFILE%/net/*
+
+
+# --- Anything ----------------------------------------------------------------
+
+# ANY SOURCE at ANY TARGET. This makes the whitelist pointless: every user
+# of the service can mount anything anywhere, which is as powerful as
+# administrator rights.
+#** | **

@@ -4,11 +4,11 @@ package main
 
 import (
 	"context"
+	"crypto/mldsa"
 	"errors"
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -31,7 +31,7 @@ const (
 var pipeName = `\\.\pipe\` + serviceName
 
 func installAction(_ context.Context, cmd *cli.Command) error {
-	if err := installService(cmd.String("group")); err != nil {
+	if err := installService(cmd.String("group"), cmd.String("pubkey"), cmd.Bool("unmount-requires-whitelist")); err != nil {
 		return fmt.Errorf("helperservice install: %w", err)
 	}
 	return nil
@@ -47,7 +47,10 @@ func uninstallAction(context.Context, *cli.Command) error {
 // daemonAction runs the helper service. The SCM starts it; run from a
 // console, it serves in the foreground until Ctrl+C.
 func daemonAction(_ context.Context, cmd *cli.Command) error {
-	s := service{group: cmd.String("group")}
+	s := service{group: cmd.String("group"), pubkey: cmd.String("pubkey"), unmountNeedsWhitelist: cmd.Bool("unmount-requires-whitelist")}
+	if s.unmountNeedsWhitelist && s.pubkey == "" {
+		return errors.New("daemon: --unmount-requires-whitelist needs --pubkey")
+	}
 	isService, err := svc.IsWindowsService()
 	if err != nil {
 		return fmt.Errorf("daemon: %w", err)
@@ -66,8 +69,24 @@ func daemonAction(_ context.Context, cmd *cli.Command) error {
 // installService creates group unless it exists (the default group with
 // Authenticated Users as its member), copies wbind.exe to the system
 // directory and installs and starts the helper service from there. The
-// service runs as LocalSystem and starts at boot.
-func installService(group string) error {
+// service runs as LocalSystem and starts at boot. With pubkey, a public key
+// file, the key is copied next to wbind.exe, and the service accepts only
+// mounts allowed by whitelists signed for it, and with
+// unmountNeedsWhitelist only such unmounts too.
+func installService(group, pubkey string, unmountNeedsWhitelist bool) error {
+	if unmountNeedsWhitelist && pubkey == "" {
+		return errors.New("--unmount-requires-whitelist needs --pubkey")
+	}
+	var key []byte
+	if pubkey != "" {
+		var err error
+		if key, err = os.ReadFile(pubkey); err != nil {
+			return fmt.Errorf("%s: %w", pubkey, cause(err))
+		}
+		if _, err := parsePublicKey(key); err != nil {
+			return fmt.Errorf("%s: %w", pubkey, err)
+		}
+	}
 	if err := requireElevated(); err != nil {
 		return err
 	}
@@ -99,22 +118,47 @@ func installService(group string) error {
 	if err != nil {
 		return err
 	}
+	keyFile, err := installedPubKey()
+	if err != nil {
+		return err
+	}
 	if err := copySelf(exe); err != nil {
 		return err
 	}
+	undo := func() {
+		os.Remove(exe)
+		if key != nil {
+			os.Remove(keyFile)
+		}
+	}
+	args := []string{"daemon", "--group", group}
+	desc := "Lets members of " + group + " manage bind mounts with 'wbind --unprivileged'."
+	if key != nil {
+		if err := os.WriteFile(keyFile, key, 0o644); err != nil {
+			undo()
+			return err
+		}
+		args = append(args, "--pubkey", keyFile)
+		if unmountNeedsWhitelist {
+			args = append(args, "--unmount-requires-whitelist")
+			desc += " Mounts and unmounts need a signed whitelist ('wbind --whitelist')."
+		} else {
+			desc += " Mounts need a signed whitelist ('wbind --whitelist')."
+		}
+	}
 	s, err := m.CreateService(serviceName, exe, mgr.Config{
 		DisplayName: "wbind helper service",
-		Description: "Lets members of " + group + " manage bind mounts with 'wbind --unprivileged'.",
+		Description: desc,
 		StartType:   mgr.StartAutomatic,
-	}, "daemon", "--group", group)
+	}, args...)
 	if err != nil {
-		os.Remove(exe) // undo the copy
+		undo()
 		return err
 	}
 	defer s.Close()
 	if err := setRecovery(s); err != nil {
 		s.Delete()
-		os.Remove(exe)
+		undo()
 		return err
 	}
 
@@ -146,8 +190,9 @@ func setRecovery(s *mgr.Service) error {
 	return s.SetRecoveryActionsOnNonCrashFailures(true)
 }
 
-// uninstallService stops and removes the helper service and its copy of
-// wbind.exe. It leaves the group alone, which may be in use elsewhere.
+// uninstallService stops and removes the helper service and its copies of
+// wbind.exe and of the public key. It leaves the group alone, which may be
+// in use elsewhere.
 func uninstallService() error {
 	if err := requireElevated(); err != nil {
 		return err
@@ -167,6 +212,13 @@ func uninstallService() error {
 		return err
 	}
 	if err := s.Delete(); err != nil {
+		return err
+	}
+	keyFile, err := installedPubKey()
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(keyFile); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	exe, err := installedExe()
@@ -207,6 +259,16 @@ func installedExe() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "wbind.exe"), nil
+}
+
+// installedPubKey is where install puts the public key: next to
+// installedExe, where only administrators can change it.
+func installedPubKey() (string, error) {
+	dir, err := windows.GetSystemDirectory()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, defaultPublicKeyFile), nil
 }
 
 // copySelf copies the running executable to dst, unless it is dst.
@@ -277,16 +339,26 @@ func waitFor(s *mgr.Service, state svc.State) (svc.Status, error) {
 
 // service is the helper service: it serves newHandler on pipeName.
 type service struct {
-	group string // members may connect, besides SYSTEM and elevated admins
+	group  string // members may connect, besides SYSTEM and elevated admins
+	pubkey string // public key file; if set, whitelists must be signed for it
+
+	unmountNeedsWhitelist bool // with pubkey: unmounts need a whitelist too
 }
 
 func (s service) Execute(_ []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
 	changes <- svc.Status{State: svc.StartPending}
+	var pub *mldsa.PublicKey
+	if s.pubkey != "" {
+		var err error
+		if pub, err = loadPublicKey(s.pubkey); err != nil {
+			return exitCode(err)
+		}
+	}
 	l, err := listen(s.group)
 	if err != nil {
 		return exitCode(err)
 	}
-	srv := &http.Server{Handler: newHandler()}
+	srv := newServer(newHandler(pub, s.unmountNeedsWhitelist))
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(l) }()
 	changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}

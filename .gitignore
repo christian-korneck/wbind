@@ -1,5 +1,11 @@
 CLAUDE.local.md
 
+# default files of 'wbind sig', for testing in the checkout
+/wbind.whitelist.txt
+/wbind.sig.txt
+/wbind.privkey.txt
+/wbind.pubkey.txt
+
 
 # --- start Go --- 
 

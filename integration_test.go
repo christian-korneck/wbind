@@ -188,7 +188,7 @@ func TestMountHidesExistingTarget(t *testing.T) {
 
 func TestUnprivilegedRoundTrip(t *testing.T) {
 	skipUnlessElevated(t)
-	startHelper(t, newHandler())
+	startHelper(t, newHandler(nil, false))
 	src, dst := sourceDir(t), mountPoint(t, "mnt")
 
 	if _, err := run(t, "mount", "-u", src, dst); err != nil {
@@ -226,6 +226,158 @@ func TestUnprivilegedRoundTrip(t *testing.T) {
 	}
 }
 
+func TestWhitelistRoundTrip(t *testing.T) {
+	skipUnlessElevated(t)
+	src, dst := sourceDir(t), mountPoint(t, "mnt")
+	pub, wl, sig := signWhitelist(t, "# test\n"+escapeMeta(src)+" | "+escapeMeta(filepath.Dir(dst))+"/*\n")
+	startHelper(t, newHandler(pub, true))
+	w := []string{"--whitelist-file", wl, "--sig-file", sig}
+
+	if _, err := run(t, append(append([]string{"-w", "mount"}, w...), src, dst)...); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "hello.txt")); err != nil {
+		t.Fatalf("file not visible through the mount: %v", err)
+	}
+	if _, err := run(t, append(append([]string{"-w", "mount"}, w...), src, dst)...); err == nil || !strings.Contains(err.Error(), "already mounted") {
+		t.Errorf("second mount: %v", err)
+	}
+	if _, err := run(t, append(append([]string{"-w", "unmount"}, w...), dst)...); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(t, append(append([]string{"-w", "unmount"}, w...), dst)...); err == nil || !strings.Contains(err.Error(), "not mounted") {
+		t.Errorf("second unmount: %v", err)
+	}
+
+	// A TARGET typed with 8.3 names is checked, mounted and verified in its
+	// canonical form (if the volume has no short names, this repeats the
+	// above).
+	short := filepath.Join(shortPath(t, filepath.Dir(dst)), "mnt")
+	if _, err := run(t, append(append([]string{"-w", "mount"}, w...), src, short)...); err != nil {
+		t.Fatalf("mount at %s: %v", short, err)
+	}
+	if _, mounted, err := findMount(dst); err != nil || !mounted {
+		t.Errorf("%s: mounted %v, %v; want mounted", dst, mounted, err)
+	}
+	if _, err := run(t, append(append([]string{"-w", "unmount"}, w...), short)...); err != nil {
+		t.Fatalf("unmount at %s: %v", short, err)
+	}
+
+	// Unmount checks the source the mount has, not one the client names.
+	other := mountPoint(t, "other")
+	if _, err := run(t, "mount", sourceDir(t), filepath.Join(filepath.Dir(dst), "other2")); err != nil {
+		t.Fatal(err)
+	}
+	unmountAtCleanup(t, filepath.Join(filepath.Dir(dst), "other2"))
+	if _, err := run(t, append(append([]string{"-w", "unmount"}, w...), filepath.Join(filepath.Dir(dst), "other2"))...); err == nil || !strings.Contains(err.Error(), "not allowed by the whitelist") {
+		t.Errorf("unmount of a mount with another source: %v", err)
+	}
+	if _, err := run(t, append(append([]string{"-w", "mount"}, w...), src, other)...); err == nil || !strings.Contains(err.Error(), "not allowed by the whitelist") {
+		t.Errorf("mount outside the whitelist: %v", err)
+	}
+}
+
+func TestWhitelistReadOnly(t *testing.T) {
+	skipUnlessElevated(t)
+	src, dst := sourceDir(t), mountPoint(t, "mnt")
+	pub, wl, sig := signWhitelist(t, escapeMeta(src)+" | "+escapeMeta(dst)+" | ro\n")
+	startHelper(t, newHandler(pub, true))
+	w := func(args ...string) error {
+		_, err := run(t, append([]string{"-w", args[0], "--whitelist-file", wl, "--sig-file", sig}, args[1:]...)...)
+		return err
+	}
+
+	if err := w("mount", src, dst); err == nil || !strings.Contains(err.Error(), "only read-only") {
+		t.Errorf("read-write mount: got %v, want a denial", err)
+	}
+	if err := w("mount", "-r", src, dst); err != nil {
+		t.Fatal(err)
+	}
+	if err := w("unmount", dst); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unmount checks the mode the mount really has.
+	if _, err := run(t, "mount", src, dst); err != nil {
+		t.Fatal(err)
+	}
+	if err := w("unmount", dst); err == nil || !strings.Contains(err.Error(), "only read-only") {
+		t.Errorf("unmount of a read-write mount: got %v, want a denial", err)
+	}
+}
+
+// TestWhitelistUnmountDefault checks that, unless unmounts need a
+// whitelist, anyone can unmount anything from a service with a public key.
+func TestWhitelistUnmountDefault(t *testing.T) {
+	skipUnlessElevated(t)
+	src := sourceDir(t)
+	pub, wl, sig := signWhitelist(t, "C:/nowhere | C:/nowhere\n")
+	startHelper(t, newHandler(pub, false))
+
+	for _, args := range [][]string{
+		{"-u", "unmount"},
+		{"-w", "unmount", "--whitelist-file", wl, "--sig-file", sig},
+	} {
+		dst := mountPoint(t, "mnt")
+		if _, err := run(t, "mount", src, dst); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := run(t, append(args, dst)...); err != nil {
+			t.Errorf("%v: %v", args, err)
+		}
+		if _, mounted, err := findMount(dst); err != nil || mounted {
+			t.Errorf("%v: mounted %v, %v; want unmounted", args, mounted, err)
+		}
+	}
+	if _, err := run(t, "-u", "mount", src, mountPoint(t, "mnt")); err == nil || !strings.Contains(err.Error(), "signed whitelist") {
+		t.Errorf("mount -u without a whitelist: %v", err)
+	}
+}
+
+// TestMountCheckedRollsBack checks that a whitelisted mount at a TARGET
+// that is a link, which the caller can create after the whitelist check,
+// never stays at the link's target: the bind filter follows the link, and
+// mountChecked removes the mount again.
+func TestMountCheckedRollsBack(t *testing.T) {
+	skipUnlessElevated(t)
+	for _, tc := range []struct {
+		name string
+		flag string // of mklink
+		file bool
+	}{
+		{"junction", "/J", false},
+		{"directory symlink", "/D", false},
+		{"file symlink", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src, elsewhere := sourceDir(t), canonical(t, t.TempDir())
+			if tc.file {
+				src, elsewhere = filepath.Join(src, "hello.txt"), filepath.Join(elsewhere, "own.txt")
+				writeFile(t, elsewhere, "own")
+			}
+			link := mountPoint(t, "link")
+			unmountAtCleanup(t, elsewhere)
+			args := []string{"/c", "mklink"}
+			if tc.flag != "" {
+				args = append(args, tc.flag)
+			}
+			if out, err := exec.Command("cmd", append(args, link, elsewhere)...).CombinedOutput(); err != nil {
+				t.Fatalf("mklink: %v\n%s", err, out)
+			}
+
+			err := (&api{}).mountChecked(src, link, false)
+			if !errors.Is(err, errMountMoved) {
+				t.Errorf("mountChecked: got %v, want %v", err, errMountMoved)
+			}
+			for _, p := range []string{link, elsewhere} {
+				if _, mounted, err := findMount(p); err != nil || mounted {
+					t.Errorf("%s: mounted %v, %v; want the mount removed", p, mounted, err)
+				}
+			}
+		})
+	}
+}
+
 // TestHelperService installs this test binary as the real helper service
 // (TestMain runs it as the daemon) and uses it through the default pipe.
 func TestHelperService(t *testing.T) {
@@ -243,8 +395,19 @@ func TestHelperService(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(exe); err == nil {
-		t.Skip(exe + " exists already")
+	keyFile, err := installedPubKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{exe, keyFile} {
+		if _, err := os.Stat(f); err == nil {
+			t.Skip(f + " exists already")
+		}
+	}
+	dir := t.TempDir()
+	pub := filepath.Join(dir, "pub.txt")
+	if _, err := run(t, "sig", "keygen", "--private", filepath.Join(dir, "key.txt"), "--public", pub); err != nil {
+		t.Fatal(err)
 	}
 	// An existing group, so that the test creates none.
 	users, err := windows.CreateWellKnownSid(windows.WinBuiltinUsersSid)
@@ -257,7 +420,7 @@ func TestHelperService(t *testing.T) {
 	}
 
 	t.Cleanup(func() { _ = uninstallService() })
-	if _, err := run(t, "helperservice", "install", "--group", domain+`\`+name); err != nil {
+	if _, err := run(t, "helperservice", "install", "--group", domain+`\`+name, "--pubkey", pub, "--unmount-requires-whitelist"); err != nil {
 		t.Fatal(err)
 	}
 	s, err := m.OpenService(serviceName)
@@ -265,8 +428,12 @@ func TestHelperService(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, err := s.Config()
-	if err != nil || !strings.HasPrefix(c.BinaryPathName, exe+" ") {
-		t.Errorf("service runs %q, %v; want %s", c.BinaryPathName, err, exe)
+	wantArgs := " --pubkey " + keyFile + " --unmount-requires-whitelist"
+	if err != nil || !strings.HasPrefix(c.BinaryPathName, exe+" ") || !strings.HasSuffix(c.BinaryPathName, wantArgs) {
+		t.Errorf("service runs %q, %v; want %s ...%s", c.BinaryPathName, err, exe, wantArgs)
+	}
+	if got := readFile(t, keyFile); string(got) != string(readFile(t, pub)) {
+		t.Errorf("%s is not a copy of the public key", keyFile)
 	}
 	if acts, err := s.RecoveryActions(); err != nil || len(acts) != 3 || acts[0].Type != mgr.ServiceRestart {
 		t.Errorf("recovery actions: %v, %v; want restarts", acts, err)
@@ -281,11 +448,19 @@ func TestHelperService(t *testing.T) {
 	if _, err := run(t, "list", "-u"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := run(t, "-u", "mount", sourceDir(t), mountPoint(t, "mnt")); err == nil || !strings.Contains(err.Error(), "signed whitelist") {
+		t.Errorf("mount -u without a whitelist: %v", err)
+	}
+	if _, err := run(t, "-u", "unmount", mountPoint(t, "mnt")); err == nil || !strings.Contains(err.Error(), "signed whitelist") {
+		t.Errorf("unmount -u without a whitelist: %v", err)
+	}
 	if _, err := run(t, "helperservice", "uninstall"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(exe); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("%s after uninstall: %v, want it removed", exe, err)
+	for _, f := range []string{exe, keyFile} {
+		if _, err := os.Stat(f); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s after uninstall: %v, want it removed", f, err)
+		}
 	}
 	if _, err := run(t, "list", "-u"); err == nil || !strings.Contains(err.Error(), "cannot connect to the helper service") {
 		t.Errorf("list -u after uninstall: %v", err)

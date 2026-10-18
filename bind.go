@@ -29,10 +29,12 @@ type binder interface {
 	list(target string) ([]bindfilter.BindMapping, error)
 }
 
-// newBinder returns the binder that cmd's --unprivileged flag asks for.
-func newBinder(cmd *cli.Command) (binder, error) {
-	if cmd.Bool("unprivileged") {
-		return helperClient{}, nil
+// newBinder returns the binder that cmd's --unprivileged and --whitelist
+// flags ask for. The helper client sends wl, if not nil (see
+// readWhitelist).
+func newBinder(cmd *cli.Command, wl *signedWhitelist) (binder, error) {
+	if cmd.Bool("unprivileged") || cmd.Bool("whitelist") {
+		return helperClient{whitelist: wl}, nil
 	}
 	if err := requireElevated(); err != nil {
 		return nil, err
@@ -55,7 +57,11 @@ func mountAction(_ context.Context, cmd *cli.Command) error {
 	if err := checkMount(source, target); err != nil {
 		return fmt.Errorf("mount: %w", err)
 	}
-	b, err := newBinder(cmd)
+	wl, err := readWhitelist(cmd)
+	if err != nil {
+		return fmt.Errorf("mount: %w", err)
+	}
+	b, err := newBinder(cmd, wl)
 	if err != nil {
 		return fmt.Errorf("mount: %w", err)
 	}
@@ -73,7 +79,11 @@ func unmountAction(_ context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return fmt.Errorf("unmount: %w", err)
 	}
-	b, err := newBinder(cmd)
+	wl, err := readWhitelist(cmd)
+	if err != nil {
+		return fmt.Errorf("unmount: %w", err)
+	}
+	b, err := newBinder(cmd, wl)
 	if err != nil {
 		return fmt.Errorf("unmount: %w", err)
 	}
@@ -168,4 +178,87 @@ func resolvePath(p string) (string, error) {
 		return final, nil
 	}
 	return abs, nil
+}
+
+// canonicalPath is resolvePath, but if p does not exist, it resolves p's
+// parent, so that only p's last element stays as given. Whitelist checks
+// use it: a junction or 8.3 name in the parent of a TARGET must not slip
+// past a rule. Everything else uses resolvePath, so that messages show
+// paths as the user typed them.
+func canonicalPath(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	if final, err := filepath.EvalSymlinks(abs); err == nil {
+		return final, nil
+	}
+	if dir, err := filepath.EvalSymlinks(filepath.Dir(abs)); err == nil {
+		return filepath.Join(dir, filepath.Base(abs)), nil
+	}
+	return abs, nil
+}
+
+// pinDir opens dir and its parent directories without sharing delete
+// access, so that none of them can be renamed, deleted or replaced by a
+// junction until release is called. (Nor can they become junctions in
+// place: that needs an empty directory.) dir must be canonical (see
+// resolvePath); pinDir fails if it no longer resolves to itself, that is
+// if one of its elements changed since it was resolved.
+func pinDir(dir string) (release func(), err error) {
+	var handles []windows.Handle
+	release = func() {
+		for _, h := range handles {
+			windows.CloseHandle(h)
+		}
+	}
+	// From the top down; the volume root cannot be renamed.
+	var dirs []string
+	for d := dir; len(d) > len(volumeRoot(dir)); d = filepath.Dir(d) {
+		dirs = append([]string{d}, dirs...)
+	}
+	for _, d := range dirs {
+		p, err := windows.UTF16PtrFromString(d)
+		if err != nil {
+			release()
+			return nil, err
+		}
+		// The share mode only binds others if the handle has data access:
+		// FILE_READ_ATTRIBUTES alone would not do.
+		h, err := windows.CreateFile(p, windows.FILE_LIST_DIRECTORY, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+			nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+		if err != nil {
+			release()
+			return nil, fmt.Errorf("%s: %w", d, err)
+		}
+		handles = append(handles, h)
+	}
+	if len(handles) > 0 {
+		if final, err := finalPath(handles[len(handles)-1]); err != nil || !strings.EqualFold(final, dir) {
+			release()
+			return nil, fmt.Errorf("%s: path changed while in use", dir)
+		}
+	}
+	return release, nil
+}
+
+// finalPath returns the path of the file open as h, with reparse points
+// resolved, as a DOS path.
+func finalPath(h windows.Handle) (string, error) {
+	buf := make([]uint16, windows.MAX_PATH)
+	for {
+		// Flags 0: FILE_NAME_NORMALIZED | VOLUME_NAME_DOS.
+		n, err := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), 0)
+		if err != nil {
+			return "", err
+		}
+		if int(n) < len(buf) {
+			p := windows.UTF16ToString(buf[:n])
+			if rest, ok := strings.CutPrefix(p, `\\?\UNC\`); ok {
+				return `\\` + rest, nil
+			}
+			return strings.TrimPrefix(p, `\\?\`), nil
+		}
+		buf = make([]uint16, n)
+	}
 }

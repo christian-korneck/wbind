@@ -29,7 +29,7 @@ func listAction(_ context.Context, cmd *cli.Command) error {
 			return fmt.Errorf("list: %w", err)
 		}
 	}
-	b, err := newBinder(cmd)
+	b, err := newBinder(cmd, nil)
 	if err != nil {
 		return fmt.Errorf("list: %w", err)
 	}
