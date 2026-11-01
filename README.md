@@ -2,7 +2,7 @@
 
 ![wbind](wbind.png)
 
-Modern MS Windows supports true, Unix-style bind mounts. The `wbind` CLI tools makes it easy to create, remove and list them. This lets you make a file or directory from another local or UNC path virtually appear at a different local path.
+Modern MS Windows supports true, Unix-style bind mounts. The `wbind` CLI tool makes it easy to create, remove and list them. This lets you make a file or directory from another local or UNC path virtually appear at a different local path.
 
 A thin CLI tool around [microsoft/go-winio](https://github.com/microsoft/go-winio)'s [`bindfilter`](https://pkg.go.dev/github.com/Microsoft/go-winio/pkg/bindfilter) package, which provides bindings to the win32 [bindflt](https://learn.microsoft.com/en-us/windows/win32/bindlink/) api.
 
