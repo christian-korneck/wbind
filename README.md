@@ -113,7 +113,7 @@ wbind -w mount --whitelist-file wl.txt --sig-file sig.txt c:\source c:\target
 
 This allows someone to place the whitelist and its signature for example as part of a script (inline or as files next to it), etc.
 
-Paths in whitelists are written in GLOB syntax (.gitignore like syntax, so various types of wildcards work) and support special windows variables like %userprofile% (resolves to the calling user's user profile and the helper service tries to prevent that the user could fake his identity to mess with foreign user profiles) or %programfiles% (which works no matter of the windows installation language).
+Paths in whitelists are written in GLOB syntax (.gitignore like syntax, so various types of wildcards work) and support special windows variables like %userprofile% (resolves to the calling user's user profile and the helper service tries to prevent that the user could fake its identity to mess with foreign user profiles) or %programfiles% (which works no matter of the windows installation language).
 
 See the [separate docs for the signed whitelist feature](README-signed-whitelists.md) and the [example whitelist](wbind.whitelist.example.txt).
 
