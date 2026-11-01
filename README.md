@@ -122,7 +122,7 @@ See the [separate docs for the signed whitelist feature](README-signed-whitelist
 
 - the source path must exist and can be a directory or a file. Local or on a UNC path (smb share).
 - the target must be on a local volume (but UNC paths / smb shares do NOT work as target)
-- the target path does not need to exist. The bind filter virtually "projects" it while the mount exists and it disappears again after an `unmount` (or reboot). However, the target path's parent directory must already exist.
+- the target path does not need to exist. The bind filter virtually "projects" it while the mount exists and it disappears again after an `unmount` (or reboot). However, the target path's parent directory must already exist. (In other words: You don't need to create a mount point dir/file before you mount).
 - if the target path already exists, its own contents are hidden while "overmounted" and come back after an `unmount` (or reboot).
 - bind mounts are system-wide and in memory. They do not persist a reboot.
 - a read-only mount rejects writes and deletions with "access denied".
